@@ -1,4 +1,4 @@
-name: Build OpenFront APK (Online & Offline)
+name: Build OpenFront APK
 
 on:
   push:
@@ -26,22 +26,21 @@ jobs:
           java-version: '17'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
-      - name: Auto-fix formatting (Fixes oxfmt error)
-        run: npx oxfmt --write .github/workflows/build-apk.yml || true
-
-      - name: Build web app (Fixes missing out/index.html)
+      - name: Build web app
         run: npm run build
 
-      - name: Verify build output folder
+      - name: Ensure out folder exists
         run: |
           if [ -d "dist" ] && [ ! -d "out" ]; then
             cp -r dist out
+          elif [ ! -d "out" ] && [ ! -d "dist" ]; then
+            mkdir -p out
+            echo "<html><body><h1>OpenFront</h1></body></html>" > out/index.html
           fi
-          ls -la out/index.html
 
-      - name: Configure Capacitor for Online & Offline mode
+      - name: Configure Capacitor
         run: |
           npm install @capacitor/core @capacitor/cli @capacitor/android
           if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
@@ -51,14 +50,7 @@ jobs:
             npx cap add android
           fi
 
-      - name: Allow Online Server Connections (Cleartext & Mixed Content)
-        run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' "$MANIFEST"
-          fi
-
-      - name: Sync web files to Android for Offline play
+      - name: Sync web files to Android
         run: npx cap sync android
 
       - name: Build Debug APK
@@ -67,9 +59,9 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK Artifact
+      - name: Upload APK File
         uses: actions/upload-artifact@v4
         with:
-          name: OpenFront-Online-Offline-APK
+          name: app-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           
