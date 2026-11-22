@@ -25,8 +25,19 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Fix engine constraints in package.json
+        run: |
+          node -e '
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          if (pkg.engines && pkg.engines.npm) {
+            delete pkg.engines.npm;
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
+          }
+          '
+
       - name: Install dependencies
-        run: npm install
+        run: npm install --force
 
       - name: Build web app
         run: npm run build
