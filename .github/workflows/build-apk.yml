@@ -1,4 +1,4 @@
-name: Build OpenFront APK
+name: Build OpenFront APK (Online & Offline)
 
 on:
   push:
@@ -13,11 +13,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'npm'
+
+      - name: Upgrade npm to v12 (Fixes EBADENGINE)
+        run: npm install -g npm@12
 
       - name: Setup Java 17
         uses: actions/setup-java@v5
@@ -25,33 +27,28 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Fix engine constraints in package.json
-        run: |
-          node -e '
-          const fs = require("fs");
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          if (pkg.engines && pkg.engines.npm) {
-            delete pkg.engines.npm;
-            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
-          }
-          '
-
       - name: Install dependencies
-        run: npm install --force
+        env:
+          npm_config_engine_strict: 'false'
+        run: npm install
 
       - name: Build web app
         run: npm run build
 
-      - name: Ensure out folder exists
+      - name: Ensure out/index.html exists
         run: |
-          if [ -d "dist" ] && [ ! -d "out" ]; then
-            cp -r dist out
-          elif [ ! -d "out" ] && [ ! -d "dist" ]; then
-            mkdir -p out
-            echo "<html><body><h1>OpenFront</h1></body></html>" > out/index.html
+          mkdir -p out
+          if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
+            cp -r dist/* out/
           fi
+          if [ ! -f "out/index.html" ]; then
+            echo '<!DOCTYPE html><html><head><title>OpenFront</title></head><body><h1>OpenFront</h1></body></html>' > out/index.html
+          fi
+          ls -la out/index.html
 
-      - name: Configure Capacitor
+      - name: Configure Capacitor (Online & Offline)
+        env:
+          npm_config_engine_strict: 'false'
         run: |
           npm install @capacitor/core @capacitor/cli @capacitor/android
           if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
@@ -61,7 +58,14 @@ jobs:
             npx cap add android
           fi
 
-      - name: Sync web files to Android
+      - name: Enable Online Server Connections (HTTP & HTTPS)
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' "$MANIFEST"
+          fi
+
+      - name: Sync Web Bundle to Android (Offline Mode)
         run: npx cap sync android
 
       - name: Build Debug APK
@@ -70,9 +74,9 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK File
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
+          name: OpenFront-Online-Offline-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           
