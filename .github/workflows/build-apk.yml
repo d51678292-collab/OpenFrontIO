@@ -28,8 +28,15 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Android SDK (use runner preinstalled SDK)
+        run: |
+          SDK_DIR="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f | sort -V | tail -n 1)
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools"
+          echo "$SDK_DIR/platform-tools" >> "$GITHUB_PATH"
 
       - name: Install OpenFront dependencies
         env:
@@ -48,63 +55,63 @@ jobs:
           cp -r static/* mobile/www/
           mv mobile/www/index.html mobile/www/offline.html.ejs
 
-          node -e '
-            const fs = require("fs");
-            const path = require("path");
-            const ejs = require(path.resolve("node_modules/ejs"));
+          node << 'NODE_EOF'
+          const fs = require("fs");
+          const path = require("path");
+          const ejs = require(path.resolve("node_modules/ejs"));
 
-            let tpl = fs.readFileSync("mobile/www/offline.html.ejs", "utf8");
+          let tpl = fs.readFileSync("mobile/www/offline.html.ejs", "utf8");
 
-            // Ensure HTML asset attributes (href/src) resolve cleanly at root "/"
-            tpl = tpl.replace(/(href|src)=(["'\''])<%[=\-_]?\s*cdnBase\s*%>/gi, "$1=$2");
+          // Ensure HTML asset attributes (href/src) resolve cleanly at root "/"
+          tpl = tpl.replace(/(href|src)=(["'])<%[=\-_]?\s*cdnBase\s*%>/gi, "$1=$2");
 
-            const data = {
-              cdnBase: JSON.stringify(""),
-              gameEnv: JSON.stringify("prod"),
-              gitCommit: JSON.stringify(process.env.GITHUB_SHA || "offline"),
-              turnstileSiteKey: JSON.stringify("1x00000000000000000000AA"),
-              jwtAudience: JSON.stringify("localhost"),
-              faroCollectorUrl: JSON.stringify(""),
-              cluster: "null",
-              instanceLetter: JSON.stringify("a"),
-              numWorkers: "1",
-              serverHost: JSON.stringify(""),
-              siteHost: JSON.stringify(""),
-              instanceId: JSON.stringify(""),
-              adsEnabled: "false",
-              assetManifest: fs.existsSync("static/asset-hashes.json")
-                ? fs.readFileSync("static/asset-hashes.json", "utf8")
-                : "{}"
-            };
+          const data = {
+            cdnBase: JSON.stringify(""),
+            gameEnv: JSON.stringify("prod"),
+            gitCommit: JSON.stringify(process.env.GITHUB_SHA || "offline"),
+            turnstileSiteKey: JSON.stringify("1x00000000000000000000AA"),
+            jwtAudience: JSON.stringify("localhost"),
+            faroCollectorUrl: JSON.stringify(""),
+            cluster: "null",
+            instanceLetter: JSON.stringify("a"),
+            numWorkers: "1",
+            serverHost: JSON.stringify(""),
+            siteHost: JSON.stringify(""),
+            instanceId: JSON.stringify(""),
+            adsEnabled: "false",
+            assetManifest: fs.existsSync("static/asset-hashes.json")
+              ? fs.readFileSync("static/asset-hashes.json", "utf8")
+              : "{}"
+          };
 
-            let rendered;
-            for (let attempt = 0; attempt < 15; attempt++) {
-              try {
-                rendered = ejs.render(tpl, data);
-                break;
-              } catch (err) {
-                const match = /([A-Za-z0-9_$]+) is not defined/.exec(err.message || "");
-                if (!match) throw err;
-                console.log("Filling missing EJS template var:", match[1]);
-                data[match[1]] = JSON.stringify("");
-              }
+          let rendered;
+          for (let attempt = 0; attempt < 15; attempt++) {
+            try {
+              rendered = ejs.render(tpl, data);
+              break;
+            } catch (err) {
+              const match = /([A-Za-z0-9_$]+) is not defined/.exec(err.message || "");
+              if (!match) throw err;
+              console.log("Filling missing EJS template var:", match[1]);
+              data[match[1]] = JSON.stringify("");
             }
+          }
 
-            if (!rendered) {
-              throw new Error("Failed to render offline.html.ejs");
-            }
+          if (!rendered) {
+            throw new Error("Failed to render offline.html.ejs");
+          }
 
-            // Remove unrendered EJS remnants if any
-            rendered = rendered.replace(/<%[\s\S]*?%>/g, "");
+          // Remove unrendered EJS remnants if any
+          rendered = rendered.replace(/<%[\s\S]*?%>/g, "");
 
-            // Strip external tracker/Turnstile scripts that stall offline boot
-            rendered = rendered.replace(/<script[^>]+challenges\.cloudflare\.com[^>]*><\/script>/gi, "");
-            rendered = rendered.replace(/<script[^>]+googletagmanager\.com[^>]*><\/script>/gi, "");
+          // Strip external tracker/Turnstile scripts that stall offline boot
+          rendered = rendered.replace(/<script[^>]+challenges\.cloudflare\.com[^>]*><\/script>/gi, "");
+          rendered = rendered.replace(/<script[^>]+googletagmanager\.com[^>]*><\/script>/gi, "");
 
-            fs.writeFileSync("mobile/www/offline.html", rendered);
-            fs.unlinkSync("mobile/www/offline.html.ejs");
-            console.log("Rendered mobile/www/offline.html successfully.");
-          '
+          fs.writeFileSync("mobile/www/offline.html", rendered);
+          fs.unlinkSync("mobile/www/offline.html.ejs");
+          console.log("Rendered mobile/www/offline.html successfully.");
+          NODE_EOF
 
       - name: Create Dual-Mode Launcher (mobile/www/index.html)
         run: |
@@ -265,10 +272,12 @@ jobs:
       - name: Configure AndroidManifest and Back-to-Launcher navigation
         run: |
           MANIFEST="mobile/android/app/src/main/AndroidManifest.xml"
-          sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MANIFEST"
+          if ! grep -q 'usesCleartextTraffic' "$MANIFEST"; then
+            sed -i '0,/<application/{s/<application/<application android:usesCleartextTraffic="true"/}' "$MANIFEST"
+          fi
 
           MAIN_ACT=$(find mobile/android/app/src/main/java -name "MainActivity.java" | head -n 1)
-          PKG_LINE=$(head -n 1 "$MAIN_ACT")
+          PKG_LINE=$(grep -m 1 '^package ' "$MAIN_ACT")
 
           cat << EOF > "$MAIN_ACT"
           $PKG_LINE
