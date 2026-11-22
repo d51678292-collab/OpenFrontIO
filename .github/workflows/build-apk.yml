@@ -2,75 +2,313 @@ name: Build OpenFront APK (Online & Offline)
 
 on:
   push:
-    branches: [main, master]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build-apk:
+  build-android:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
-      - name: Upgrade npm to v12 (Fixes EBADENGINE)
-        run: npm install -g npm@12
+      - name: Upgrade npm to 12.1.0
+        run: npm install --global --ignore-scripts npm@12.1.0
 
-      - name: Setup Java 17
+      - name: Setup Java 21
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      - name: Install dependencies
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install OpenFront dependencies
         env:
-          npm_config_engine_strict: 'false'
-        run: npm install
+          HUSKY: 0
+        run: npm run inst
 
-      - name: Build web app
-        run: npm run build
-
-      - name: Ensure out/index.html exists
-        run: |
-          mkdir -p out
-          if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
-            cp -r dist/* out/
-          fi
-          if [ ! -f "out/index.html" ]; then
-            echo '<!DOCTYPE html><html><head><title>OpenFront</title></head><body><h1>OpenFront</h1></body></html>' > out/index.html
-          fi
-          ls -la out/index.html
-
-      - name: Configure Capacitor (Online & Offline)
+      - name: Build web app into static/
         env:
-          npm_config_engine_strict: 'false'
-        run: |
-          npm install @capacitor/core @capacitor/cli @capacitor/android
-          if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
-            npx cap init "OpenFront" "io.openfront.app" --web-dir="out"
-          fi
-          if [ ! -d "android" ]; then
-            npx cap add android
-          fi
+          GIT_COMMIT: ${{ github.sha }}
+        run: npm run build-prod
 
-      - name: Enable Online Server Connections (HTTP & HTTPS)
+      - name: Verify static/ output and render EJS template for offline WebView
         run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' "$MANIFEST"
-          fi
+          test -f static/index.html
+          mkdir -p mobile/www
+          cp -r static/* mobile/www/
+          mv mobile/www/index.html mobile/www/offline.html.ejs
 
-      - name: Sync Web Bundle to Android (Offline Mode)
-        run: npx cap sync android
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const ejs = require(path.resolve("node_modules/ejs"));
+
+            let tpl = fs.readFileSync("mobile/www/offline.html.ejs", "utf8");
+
+            // Ensure HTML asset attributes (href/src) resolve cleanly at root "/"
+            tpl = tpl.replace(/(href|src)=(["'\''])<%[=\-_]?\s*cdnBase\s*%>/gi, "$1=$2");
+
+            const data = {
+              cdnBase: JSON.stringify(""),
+              gameEnv: JSON.stringify("prod"),
+              gitCommit: JSON.stringify(process.env.GITHUB_SHA || "offline"),
+              turnstileSiteKey: JSON.stringify("1x00000000000000000000AA"),
+              jwtAudience: JSON.stringify("localhost"),
+              faroCollectorUrl: JSON.stringify(""),
+              cluster: "null",
+              instanceLetter: JSON.stringify("a"),
+              numWorkers: "1",
+              serverHost: JSON.stringify(""),
+              siteHost: JSON.stringify(""),
+              instanceId: JSON.stringify(""),
+              adsEnabled: "false",
+              assetManifest: fs.existsSync("static/asset-hashes.json")
+                ? fs.readFileSync("static/asset-hashes.json", "utf8")
+                : "{}"
+            };
+
+            let rendered;
+            for (let attempt = 0; attempt < 15; attempt++) {
+              try {
+                rendered = ejs.render(tpl, data);
+                break;
+              } catch (err) {
+                const match = /([A-Za-z0-9_$]+) is not defined/.exec(err.message || "");
+                if (!match) throw err;
+                console.log("Filling missing EJS template var:", match[1]);
+                data[match[1]] = JSON.stringify("");
+              }
+            }
+
+            if (!rendered) {
+              throw new Error("Failed to render offline.html.ejs");
+            }
+
+            // Remove unrendered EJS remnants if any
+            rendered = rendered.replace(/<%[\s\S]*?%>/g, "");
+
+            // Strip external tracker/Turnstile scripts that stall offline boot
+            rendered = rendered.replace(/<script[^>]+challenges\.cloudflare\.com[^>]*><\/script>/gi, "");
+            rendered = rendered.replace(/<script[^>]+googletagmanager\.com[^>]*><\/script>/gi, "");
+
+            fs.writeFileSync("mobile/www/offline.html", rendered);
+            fs.unlinkSync("mobile/www/offline.html.ejs");
+            console.log("Rendered mobile/www/offline.html successfully.");
+          '
+
+      - name: Create Dual-Mode Launcher (mobile/www/index.html)
+        run: |
+          cat << 'EOF' > mobile/www/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+            <title>OpenFront Mobile</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: radial-gradient(circle at top, #1e293b, #0b1120 70%);
+                color: #f8fafc;
+                font-family: system-ui, -apple-system, sans-serif;
+                padding: 24px;
+              }
+              .card {
+                width: 100%;
+                max-width: 420px;
+                background: rgba(15, 23, 42, 0.9);
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                border-radius: 20px;
+                padding: 28px 24px;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+                text-align: center;
+              }
+              h1 { font-size: 1.75rem; font-weight: 800; margin-bottom: 6px; }
+              .subtitle { color: #94a3b8; font-size: 0.92rem; margin-bottom: 18px; }
+              .status {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                padding: 6px 14px;
+                border-radius: 999px;
+                font-size: 0.85rem;
+                font-weight: 600;
+                margin-bottom: 24px;
+                background: rgba(30, 41, 59, 0.9);
+                border: 1px solid rgba(148, 163, 184, 0.25);
+              }
+              .dot { width: 9px; height: 9px; border-radius: 50%; }
+              .dot.online { background: #22c55e; }
+              .dot.offline { background: #f59e0b; }
+              .btn {
+                width: 100%;
+                border: none;
+                border-radius: 14px;
+                padding: 16px 18px;
+                font-size: 1rem;
+                font-weight: 700;
+                cursor: pointer;
+                margin-bottom: 14px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 4px;
+                transition: transform 0.1s ease, opacity 0.15s ease;
+              }
+              .btn:active { transform: scale(0.98); }
+              .btn-offline {
+                background: linear-gradient(135deg, #2563eb, #1d4ed8);
+                color: #ffffff;
+              }
+              .btn-online {
+                background: linear-gradient(135deg, #059669, #047857);
+                color: #ffffff;
+              }
+              .btn small { font-weight: 400; font-size: 0.8rem; opacity: 0.9; }
+              .hint { color: #64748b; font-size: 0.78rem; margin-top: 8px; line-height: 1.4; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>OpenFront.io</h1>
+              <p class="subtitle">Choose how you want to play</p>
+
+              <div class="status" id="netStatus">
+                <span class="dot offline" id="netDot"></span>
+                <span id="netText">Checking connection...</span>
+              </div>
+
+              <button class="btn btn-offline" onclick="location.href='/offline.html'">
+                <span>Play Offline</span>
+                <small>Singleplayer vs AI &bull; Works with no internet</small>
+              </button>
+
+              <button class="btn btn-online" onclick="goOnline()">
+                <span>Play Online</span>
+                <small>Official openfront.io multiplayer &amp; accounts</small>
+              </button>
+
+              <p class="hint">
+                Press the Android Back button to return to this mode selector.<br/>
+                &copy; OpenFront and Contributors
+              </p>
+            </div>
+
+            <script>
+              function updateStatus() {
+                const online = navigator.onLine;
+                document.getElementById("netDot").className = "dot " + (online ? "online" : "offline");
+                document.getElementById("netText").textContent = online
+                  ? "Internet Connected"
+                  : "Offline Mode Available";
+              }
+              function goOnline() {
+                if (!navigator.onLine && !confirm("No internet connection detected. Try opening openfront.io anyway?")) {
+                  return;
+                }
+                window.location.href = "https://openfront.io";
+              }
+              window.addEventListener("online", updateStatus);
+              window.addEventListener("offline", updateStatus);
+              updateStatus();
+            </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Initialize isolated Capacitor 7 Android project
+        run: |
+          cd mobile
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "io.openfront.mobile",
+            "appName": "OpenFront",
+            "webDir": "www",
+            "server": {
+              "androidScheme": "https",
+              "allowNavigation": [
+                "openfront.io",
+                "*.openfront.io",
+                "api.openfront.io",
+                "challenges.cloudflare.com",
+                "*.cloudflare.com",
+                "discord.com",
+                "*.discord.com"
+              ]
+            },
+            "android": {
+              "allowMixedContent": true
+            }
+          }
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Configure AndroidManifest and Back-to-Launcher navigation
+        run: |
+          MANIFEST="mobile/android/app/src/main/AndroidManifest.xml"
+          sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MANIFEST"
+
+          MAIN_ACT=$(find mobile/android/app/src/main/java -name "MainActivity.java" | head -n 1)
+          PKG_LINE=$(head -n 1 "$MAIN_ACT")
+
+          cat << EOF > "$MAIN_ACT"
+          $PKG_LINE
+
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import androidx.activity.OnBackPressedCallback;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+                      @Override
+                      public void handleOnBackPressed() {
+                          WebView webView = getBridge() != null ? getBridge().getWebView() : null;
+                          if (webView != null) {
+                              String url = webView.getUrl();
+                              if (webView.canGoBack()) {
+                                  webView.goBack();
+                                  return;
+                              }
+                              if (url != null && !url.equals("https://localhost/") && !url.equals("https://localhost/index.html")) {
+                                  webView.loadUrl("https://localhost/index.html");
+                                  return;
+                              }
+                          }
+                          setEnabled(false);
+                          getOnBackPressedDispatcher().onBackPressed();
+                      }
+                  });
+              }
+          }
+          EOF
 
       - name: Build Debug APK
+        working-directory: mobile/android
         run: |
-          cd android
           chmod +x gradlew
           ./gradlew assembleDebug
 
@@ -78,5 +316,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OpenFront-Online-Offline-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
