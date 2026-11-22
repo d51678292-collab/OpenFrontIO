@@ -1,4 +1,4 @@
-name: Build OpenFront APK
+name: Build OpenFront Online & Offline APK
 
 on:
   workflow_dispatch:
@@ -23,19 +23,19 @@ jobs:
       - name: Install OpenFront Dependencies
         run: npm run inst
 
-      - name: Build Web Client & Engine
+      - name: Build Web Client & Local Single-Player Engine
         run: npm run build
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"
 
-      - name: Configure Capacitor for Online & Offline Support
+      - name: Configure Capacitor for Online + Offline Hybrid Mode
         run: |
           npm install --no-save @capacitor/core @capacitor/cli @capacitor/android
           cat << 'EOF' > capacitor.config.json
           {
             "appId": "io.openfront.app",
             "appName": "OpenFront",
-            "webDir": "dist",
+            "webDir": "out",
             "server": {
               "androidScheme": "https",
               "allowNavigation": ["openfront.io", "*.openfront.io"]
@@ -44,7 +44,7 @@ jobs:
           EOF
           npx cap add android
 
-      - name: Enable Network Permissions
+      - name: Enable Network & WebSocket Permissions in Android
         run: |
           sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
 
@@ -57,7 +57,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Sync Capacitor Android
+      - name: Sync Web Bundle into Android Project
         run: npx cap sync android
 
       - name: Compile Debug APK
@@ -66,9 +66,9 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK Artifact
+      - name: Upload Hybrid APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OpenFront-APK
+          name: OpenFront-Online-Offline-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           
