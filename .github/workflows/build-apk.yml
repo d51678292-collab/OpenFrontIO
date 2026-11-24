@@ -48,7 +48,7 @@ jobs:
           GIT_COMMIT: ${{ github.sha }}
         run: npm run build-prod
 
-      - name: Verify static/ output and render EJS template for offline WebView
+      - name: Verify static/ output, deduplicate assets, and render offline.html
         run: |
           test -f static/index.html
           mkdir -p mobile/www
@@ -60,57 +60,7 @@ jobs:
           import path from "path";
           import ejs from "ejs";
 
-          let publicManifest: Record<string, string> | null = null;
-          const jsonFiles = fs.readdirSync("static").filter((f) => f.endsWith(".json"));
-          console.log("JSON files in static/:", jsonFiles);
-
-          for (const file of jsonFiles) {
-            if (file === "asset-hashes.json") continue;
-            try {
-              const parsed = JSON.parse(fs.readFileSync(path.join("static", file), "utf8"));
-              const candidate =
-                parsed && typeof parsed === "object"
-                  ? parsed.assets || parsed.manifest || parsed
-                  : null;
-              if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
-                const entries = Object.entries(candidate);
-                const isMapManifest = entries.some(
-                  ([k, v]) =>
-                    typeof v === "string" &&
-                    (k.includes("map.bin") || v.includes("_assets/"))
-                );
-                if (isMapManifest) {
-                  publicManifest = candidate as Record<string, string>;
-                  console.log(`Loaded asset manifest from static/${file} (${entries.length} entries)`);
-                  break;
-                }
-              }
-            } catch {
-              // ignore non-manifest json
-            }
-          }
-
-          if (!publicManifest && fs.existsSync("src/server/PublicAssetManifest.ts")) {
-            try {
-              const mod = await import(path.resolve("src/server/PublicAssetManifest.ts"));
-              const dirs: string[] = [];
-              if (mod.getResourcesDir) dirs.push(mod.getResourcesDir(process.cwd()));
-              if (mod.getProprietaryDir) {
-                const propDir = mod.getProprietaryDir(process.cwd());
-                if (propDir && fs.existsSync(propDir)) dirs.push(propDir);
-              }
-              if (mod.buildPublicAssetManifest && dirs.length > 0) {
-                const built = mod.buildPublicAssetManifest(dirs);
-                if (built && Object.keys(built).length > 0) {
-                  publicManifest = built;
-                  console.log(`Built asset manifest via PublicAssetManifest.ts (${Object.keys(built).length} entries)`);
-                }
-              }
-            } catch (e) {
-              console.warn("Could not load PublicAssetManifest.ts:", (e as Error).message);
-            }
-          }
-
+          // Merge unhashed resources/ (maps, icons, images, sprites, sounds, etc.)
           for (const baseDir of ["resources", "proprietary"]) {
             if (!fs.existsSync(baseDir)) continue;
             for (const entry of fs.readdirSync(baseDir)) {
@@ -128,6 +78,24 @@ jobs:
             throw new Error("Fatal: mobile/www/maps/tutorial/map.bin is missing!");
           }
 
+          // Remove duplicate hashed _assets/ so maps/images aren't stored twice in the APK
+          if (fs.existsSync("mobile/www/_assets")) {
+            const bundleFiles = fs.existsSync("mobile/www/assets")
+              ? fs.readdirSync("mobile/www/assets").filter((f) => f.endsWith(".js") || f.endsWith(".css"))
+              : [];
+            const hasHardcodedUnderscoreAssets = bundleFiles.some((f) =>
+              fs.readFileSync(path.join("mobile/www/assets", f), "utf8").includes("_assets/")
+            );
+            if (!hasHardcodedUnderscoreAssets) {
+              fs.rmSync("mobile/www/_assets", { recursive: true, force: true });
+              console.log("Removed duplicate mobile/www/_assets/ to cut APK size.");
+            } else if (fs.existsSync("mobile/www/_assets/maps")) {
+              fs.rmSync("mobile/www/_assets/maps", { recursive: true, force: true });
+              console.log("Removed duplicate mobile/www/_assets/maps/ to cut APK size.");
+            }
+          }
+
+          // Render offline.html.ejs using direct unhashed paths (assetManifest: "{}")
           let tpl = fs.readFileSync("mobile/www/offline.html.ejs", "utf8");
           tpl = tpl.replace(/(href|src|content)=(["'])<%[=\-_]?[^%]*%>/gi, "$1=$2");
 
@@ -145,7 +113,7 @@ jobs:
             siteHost: JSON.stringify(""),
             instanceId: JSON.stringify(""),
             adsEnabled: "false",
-            assetManifest: JSON.stringify(publicManifest || {})
+            assetManifest: "{}"
           };
 
           let rendered = "";
@@ -168,8 +136,13 @@ jobs:
           rendered = rendered.replace(/<%[\s\S]*?%>/g, "");
           rendered = rendered.replace(/<script[^>]+challenges\.cloudflare\.com[^>]*><\/script>/gi, "");
           rendered = rendered.replace(/<script[^>]+googletagmanager\.com[^>]*><\/script>/gi, "");
-          // Prevent WebView from expanding under the camera notch
-          rendered = rendered.replace(/,?\s*viewport-fit=cover/gi, "");
+
+          // Ensure viewport-fit=cover is enabled so WebView fills the entire screen with no notch border
+          rendered = rendered.replace(
+            /(<meta[^>]*name=["']viewport["'][^>]*content=["'][^"']*)(["'])/i,
+            (full, prefix, quote) =>
+              /viewport-fit=/i.test(full) ? full : `${prefix}, viewport-fit=cover${quote}`
+          );
 
           fs.writeFileSync("mobile/www/offline.html", rendered);
           fs.unlinkSync("mobile/www/offline.html.ejs");
@@ -183,7 +156,7 @@ jobs:
           <html lang="en">
           <head>
             <meta charset="UTF-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
             <title>OpenFront Mobile</title>
             <style>
               * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -272,10 +245,7 @@ jobs:
                 <small>Official openfront.io multiplayer &amp; accounts</small>
               </button>
 
-              <p class="hint">
-                Press the Android Back button to return to this mode selector.<br/>
-                &copy; OpenFront and Contributors
-              </p>
+              <p class="hint">&copy; OpenFront and Contributors</p>
             </div>
 
             <script>
@@ -332,7 +302,7 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Configure AndroidManifest, Fullscreen No-Notch mode, and Back navigation
+      - name: Configure AndroidManifest and Edge-to-Edge Fullscreen (no notch border)
         run: |
           MANIFEST="mobile/android/app/src/main/AndroidManifest.xml"
           if ! grep -q 'usesCleartextTraffic' "$MANIFEST"; then
@@ -349,8 +319,6 @@ jobs:
           import android.os.Bundle;
           import android.view.View;
           import android.view.WindowManager;
-          import android.webkit.WebView;
-          import androidx.activity.OnBackPressedCallback;
           import androidx.core.graphics.Insets;
           import androidx.core.view.ViewCompat;
           import androidx.core.view.WindowCompat;
@@ -362,47 +330,32 @@ jobs:
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
-
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                      WindowManager.LayoutParams lp = getWindow().getAttributes();
-                      lp.layoutInDisplayCutoutMode =
-                          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
-                      getWindow().setAttributes(lp);
-                  }
-
-                  getWindow().getDecorView().setBackgroundColor(0xFF0B1120);
-                  applyFullscreenNoNotch();
-
-                  getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
-                      @Override
-                      public void handleOnBackPressed() {
-                          WebView webView = getBridge() != null ? getBridge().getWebView() : null;
-                          if (webView != null) {
-                              String url = webView.getUrl();
-                              if (webView.canGoBack()) {
-                                  webView.goBack();
-                                  return;
-                              }
-                              if (url != null && !url.equals("https://localhost/") && !url.equals("https://localhost/index.html")) {
-                                  webView.loadUrl("https://localhost/index.html");
-                                  return;
-                              }
-                          }
-                          setEnabled(false);
-                          getOnBackPressedDispatcher().onBackPressed();
-                      }
-                  });
+                  applyEdgeToEdgeFullscreen();
               }
 
               @Override
               public void onWindowFocusChanged(boolean hasFocus) {
                   super.onWindowFocusChanged(hasFocus);
                   if (hasFocus) {
-                      applyFullscreenNoNotch();
+                      applyEdgeToEdgeFullscreen();
                   }
               }
 
-              private void applyFullscreenNoNotch() {
+              private void applyEdgeToEdgeFullscreen() {
+                  WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      WindowManager.LayoutParams lp = getWindow().getAttributes();
+                      lp.layoutInDisplayCutoutMode =
+                          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+                      getWindow().setAttributes(lp);
+                  } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                      WindowManager.LayoutParams lp = getWindow().getAttributes();
+                      lp.layoutInDisplayCutoutMode =
+                          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                      getWindow().setAttributes(lp);
+                  }
+
                   WindowInsetsControllerCompat controller =
                       WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
                   if (controller != null) {
@@ -414,16 +367,9 @@ jobs:
 
                   View content = findViewById(android.R.id.content);
                   if (content != null) {
-                      content.setBackgroundColor(0xFF0B1120);
                       ViewCompat.setOnApplyWindowInsetsListener(content, (v, windowInsets) -> {
-                          Insets cutout = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout());
                           Insets ime = windowInsets.getInsets(WindowInsetsCompat.Type.ime());
-                          v.setPadding(
-                              cutout.left,
-                              cutout.top,
-                              cutout.right,
-                              Math.max(cutout.bottom, ime.bottom)
-                          );
+                          v.setPadding(0, 0, 0, ime.bottom);
                           return windowInsets;
                       });
                       ViewCompat.requestApplyInsets(content);
@@ -437,8 +383,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug
-          echo "Verifying maps and icons inside APK:"
-          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E "maps/tutorial/map\.bin|_assets/|icons/" | awk 'NR<=20' || true
+          echo "Asset folder breakdown:"
+          du -sh ../../mobile/www/* | sort -hr | awk 'NR<=10' || true
+          echo "Final APK size:"
+          ls -lh app/build/outputs/apk/debug/app-debug.apk
           unzip -qql app/build/outputs/apk/debug/app-debug.apk "assets/public/maps/tutorial/map.bin" | grep -q "map.bin"
 
       - name: Upload APK Artifact
